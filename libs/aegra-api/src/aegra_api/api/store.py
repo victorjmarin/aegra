@@ -44,7 +44,7 @@ async def put_store_item(request: StorePutRequest, user: User = Depends(get_curr
             request.value = filters["value"]
 
     # Apply user namespace scoping
-    scoped_namespace = apply_user_namespace_scoping(user.identity, request.namespace)
+    scoped_namespace = apply_namespace_scoping(request.namespace, user_id=user.identity, org_id=user.org_id)
 
     store = db_manager.get_store()
 
@@ -78,7 +78,9 @@ async def get_store_item(
             key = filters["key"]
 
     # Apply user namespace scoping
-    scoped_namespace = apply_user_namespace_scoping(user.identity, _normalize_namespace(namespace))
+    scoped_namespace = apply_namespace_scoping(
+        _normalize_namespace(namespace), user_id=user.identity, org_id=user.org_id
+    )
 
     store = db_manager.get_store()
 
@@ -127,7 +129,7 @@ async def delete_store_item(
             k = filters["key"]
 
     # Apply user namespace scoping
-    scoped_namespace = apply_user_namespace_scoping(user.identity, ns)
+    scoped_namespace = apply_namespace_scoping(ns, user_id=user.identity, org_id=user.org_id)
 
     store = db_manager.get_store()
 
@@ -160,7 +162,7 @@ async def search_store_items(
             request.filter = {**(request.filter or {}), **handler_filters}
 
     # Apply user namespace scoping
-    scoped_prefix = apply_user_namespace_scoping(user.identity, request.namespace_prefix)
+    scoped_prefix = apply_namespace_scoping(request.namespace_prefix, user_id=user.identity, org_id=user.org_id)
 
     store = db_manager.get_store()
 
@@ -207,7 +209,7 @@ async def list_namespaces(
             request.suffix = filters["suffix"]
 
     # Apply user namespace scoping to prefix
-    scoped_prefix = apply_user_namespace_scoping(user.identity, request.prefix or [])
+    scoped_prefix = apply_namespace_scoping(request.prefix or [], user_id=user.identity, org_id=user.org_id)
     prefix: tuple[str, ...] = tuple(scoped_prefix)
     suffix: tuple[str, ...] | None = tuple(request.suffix) if request.suffix else None
 
@@ -233,17 +235,29 @@ def _normalize_namespace(value: str | list[str] | None) -> list[str]:
     return []
 
 
-def apply_user_namespace_scoping(user_id: str, namespace: list[str]) -> list[str]:
-    """Apply user-based namespace scoping for data isolation.
-
-    All store operations are scoped to the authenticated user's namespace.
-    Users can only access namespaces under ["users", <their_user_id>].
-    """
+def _scope(prefix: str, scope_id: str, namespace: list[str]) -> list[str]:
+    """Bury a namespace under [prefix, scope_id] unless it is already exactly that."""
     if not namespace:
-        return ["users", user_id]
+        return [prefix, scope_id]
 
-    if namespace[0] == "users" and len(namespace) >= 2 and namespace[1] == user_id:
+    if namespace[0] == prefix and len(namespace) >= 2 and namespace[1] == scope_id:
         return namespace
 
-    # Scope any other namespace under the user's prefix
-    return ["users", user_id] + namespace
+    return [prefix, scope_id, *namespace]
+
+
+def apply_namespace_scoping(namespace: list[str], *, user_id: str, org_id: str | None) -> list[str]:
+    """Scope store namespaces for data isolation.
+
+    User scope is the default. Org scope is strictly opt-in via a leading "orgs"
+    element: ["orgs", <org_id>, ...] is shared across org members. Same isolation
+    rule for both.
+    """
+    # User scope is the default — only a leading "orgs" element opts into org scope.
+    if not namespace or namespace[0] != "orgs":
+        return _scope("users", user_id, namespace)
+
+    if not org_id:
+        raise HTTPException(403, "User is not part of an organization")
+
+    return _scope("orgs", org_id, namespace)

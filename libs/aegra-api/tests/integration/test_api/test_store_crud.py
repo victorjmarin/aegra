@@ -215,7 +215,7 @@ class TestGetStoreItem:
         """Test empty namespace query param is treated as no namespace"""
         from unittest.mock import patch
 
-        from aegra_api.api.store import apply_user_namespace_scoping
+        from aegra_api.api.store import apply_namespace_scoping
 
         mock_item = DummyStoreItem(
             key="test-key",
@@ -225,13 +225,13 @@ class TestGetStoreItem:
         mock_store.aget.return_value = mock_item
 
         with patch(
-            "aegra_api.api.store.apply_user_namespace_scoping",
-            wraps=apply_user_namespace_scoping,
+            "aegra_api.api.store.apply_namespace_scoping",
+            wraps=apply_namespace_scoping,
         ) as spy:
             resp = client.get("/store/items?namespace=&key=test-key")
 
         assert resp.status_code == 200
-        spy.assert_called_once_with("test-user", [])
+        spy.assert_called_once_with([], user_id="test-user", org_id=None)
         call_args = mock_store.aget.call_args
         assert call_args[0][0] == ("users", "test-user")
 
@@ -270,16 +270,16 @@ class TestDeleteStoreItem:
         """Test empty namespace query param is treated as no namespace"""
         from unittest.mock import patch
 
-        from aegra_api.api.store import apply_user_namespace_scoping
+        from aegra_api.api.store import apply_namespace_scoping
 
         with patch(
-            "aegra_api.api.store.apply_user_namespace_scoping",
-            wraps=apply_user_namespace_scoping,
+            "aegra_api.api.store.apply_namespace_scoping",
+            wraps=apply_namespace_scoping,
         ) as spy:
             resp = client.delete("/store/items?key=test-key&namespace=")
 
         assert resp.status_code == 204
-        spy.assert_called_once_with("test-user", [])
+        spy.assert_called_once_with([], user_id="test-user", org_id=None)
         call_args = mock_store.adelete.call_args
         assert call_args[0][0] == ("users", "test-user")
 
@@ -694,6 +694,97 @@ class TestNamespaceScoping:
         call_args = mock_store.asearch.call_args
         namespace_prefix = call_args[0][0]
         assert namespace_prefix == ("users", "test-user", "users", "other-user", "docs")
+
+
+@pytest.fixture
+def org_client(mock_store):
+    """Test client whose authenticated user belongs to an organization."""
+    from aegra_api.core.auth_deps import get_current_user, require_auth
+    from aegra_api.models.auth import User
+
+    app = create_test_app(include_runs=False, include_threads=False)
+    org_user = User(identity="test-user", display_name="Test User", org_id="org-1")
+    app.dependency_overrides[require_auth] = lambda: org_user
+    app.dependency_overrides[get_current_user] = lambda: org_user
+
+    from aegra_api.api import store as store_module
+
+    app.include_router(store_module.router)
+
+    import aegra_api.core.database as db_module
+
+    db_module.db_manager.get_store = lambda: mock_store
+
+    return make_client(app)
+
+
+class TestOrgNamespaceScoping:
+    """Test organization namespace scoping via the "orgs" prefix."""
+
+    def test_put_org_namespace_scopes_to_org(self, org_client, mock_store) -> None:
+        """A fully-qualified org namespace passes through to the org scope."""
+        resp = org_client.put(
+            "/store/items",
+            json={
+                "namespace": ["orgs", "org-1", "shared-prompts"],
+                "key": "greeting",
+                "value": {"text": "hi"},
+            },
+        )
+
+        assert resp.status_code == 204
+        namespace = mock_store.aput.call_args.kwargs["namespace"]
+        assert namespace == ("orgs", "org-1", "shared-prompts")
+
+    def test_get_org_namespace_scopes_to_org(self, org_client, mock_store) -> None:
+        mock_store.aget.return_value = DummyStoreItem("greeting", {"text": "hi"}, ("orgs", "org-1"))
+
+        resp = org_client.get("/store/items?key=greeting&namespace=orgs&namespace=org-1")
+
+        assert resp.status_code == 200
+        namespace = mock_store.aget.call_args[0][0]
+        assert namespace == ("orgs", "org-1")
+
+    def test_search_org_namespace_scopes_to_org(self, org_client, mock_store) -> None:
+        mock_store.asearch.return_value = []
+
+        resp = org_client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["orgs", "org-1", "docs"]},
+        )
+
+        assert resp.status_code == 200
+        namespace_prefix = mock_store.asearch.call_args[0][0]
+        assert namespace_prefix == ("orgs", "org-1", "docs")
+
+    def test_other_org_namespace_is_buried(self, org_client, mock_store) -> None:
+        """A foreign org id never passes through — it is buried under the caller's org."""
+        resp = org_client.put(
+            "/store/items",
+            json={
+                "namespace": ["orgs", "victim-org", "secrets"],
+                "key": "stolen",
+                "value": {"data": "nope"},
+            },
+        )
+
+        assert resp.status_code == 204
+        namespace = mock_store.aput.call_args.kwargs["namespace"]
+        assert namespace == ("orgs", "org-1", "orgs", "victim-org", "secrets")
+
+    def test_org_prefix_without_org_membership_is_forbidden(self, client, mock_store) -> None:
+        """A user with no org_id using the "orgs" prefix gets 403."""
+        resp = client.put(
+            "/store/items",
+            json={
+                "namespace": ["orgs", "shared-prompts"],
+                "key": "greeting",
+                "value": {"text": "hi"},
+            },
+        )
+
+        assert resp.status_code == 403
+        mock_store.aput.assert_not_called()
 
 
 class TestStoreIntegration:

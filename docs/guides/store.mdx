@@ -94,6 +94,27 @@ All store operations are automatically scoped to the authenticated user's namesp
 
 This ensures users can never access each other's data, even if they craft a request with another user's namespace.
 
+### Organization scoping
+
+To share data across everyone in an organization, opt into **org scoping** by starting your namespace with `"orgs"`. Org-scoped data lives under `["orgs", <org_id>]`, where `<org_id>` comes from the authenticated user's `org_id` (populated by your auth handler).
+
+```python
+# Shared across all members of the caller's organization
+await client.store.put_item(
+    namespace=["orgs", "<org_id>", "shared-prompts"],
+    key="greeting",
+    value={"text": "Hello from the team"},
+)
+```
+
+Scoping follows the same rule as user scoping:
+
+- A fully-qualified namespace `["orgs", <org_id>, ...]` passes through unchanged. The `<org_id>` is visible in `get`/`search`/`list_namespaces` responses, which echo the scoped namespace.
+- Any namespace not fully qualified with your own `org_id` (including a foreign org id) is buried under `["orgs", <org_id>, ...]`, so members can never reach another organization's data.
+- If a request uses the `"orgs"` prefix but the user has no `org_id`, the server responds with **403 Forbidden**.
+
+An empty or non-`"orgs"` namespace always defaults to user scope — org scope is never applied implicitly.
+
 ## Semantic search
 
 When you configure vector embeddings, the store gains semantic search capabilities. Items are automatically embedded when stored and can be queried by meaning.
